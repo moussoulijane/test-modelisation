@@ -5,7 +5,11 @@ Deux notebooks Jupyter autonomes pour projeter à 90 jours :
 - **`modelisation_comptes_cheques.ipynb`** — série `Credit Décaissement_comptes chèques`
 - **`modelisation_credits_equipement.ipynb`** — série `Credit Décaissement_crédits à lequipement`
 
-Chaque notebook : EDA, tests de stationnarité (ADF/KPSS), détection automatique des ruptures et outliers, ARIMAX avec exogènes calendaires, sélection d'ordre par walk-forward MAPE, diagnostic résidus, hold-out 60 j, projection 90 j avec intervalles de confiance empiriques asymétriques, et export Excel.
+Chaque notebook : EDA, tests de stationnarité (ADF/KPSS), détection automatique des ruptures et outliers, SARIMAX avec exogènes calendaires, sélection d'ordre par walk-forward MAPE, diagnostic résidus, hold-out 60 j, panel multi-modèles, projection 90 j avec intervalles de confiance empiriques asymétriques, et export Excel.
+
+La sélection finale combine désormais plusieurs candidats (SARIMAX full, SARIMAX post-rupture, ETS, Theta, Holt-damped, LightGBM si installé). Les poids de l'ensemble sont appris sur la MAPE médiane walk-forward du panel complet, puis validés sur le hold-out final. Si le modèle ne bat pas le meilleur baseline de plus de 5 %, le notebook bascule explicitement sur le baseline.
+
+Pour les crédits équipement, un modèle intermittent deux étages est ajouté : probabilité de décaissement × montant conditionnel positif. Si `lightgbm` n'est pas installé ou si l'échantillon est trop court, il bascule automatiquement sur un lissage TSB simple.
 
 ## Structure
 
@@ -28,17 +32,19 @@ Chaque notebook : EDA, tests de stationnarité (ADF/KPSS), détection automatiqu
 
 ```
 numpy pandas matplotlib seaborn scipy statsmodels openpyxl
+lightgbm  # optionnel, active les modèles ML et intermittent avancé
 ```
 
 ## Différences méthodologiques entre les deux séries
 
 | Aspect | Comptes chèques | Crédits équipement |
 |---|---|---|
-| Transformation | log obligatoire | log si positive |
-| Saisonnalité | hebdo + fin de mois | trimestrielle + août |
+| Transformation | log si toutes les valeurs sont positives | log désactivé automatiquement si >15% de zéros |
+| Saisonnalité | hebdo ouvrée + fin de mois | trimestrielle + août |
 | Calendar dummies | DOW + EOM | EOQ + août (DOW testé par AIC) |
 | Détection ruptures | 1 rupture (nov 2025) | multi-ruptures via CUSUM segmenté |
-| Baseline alternatif | RW + drift | moyenne trimestrielle |
+| Baselines | naïf, RW + drift, naïf saisonnier | naïf, moyenne trimestrielle, naïf saisonnier |
+| Sélection finale | ensemble inverse-MAPE walk-forward ou baseline si gain <5% | ensemble inverse-MAPE walk-forward + intermittent two-stage ou baseline si gain <5% |
 | Fiabilité projection | toute la fenêtre 90 j | dégradation marquée au-delà de 30 j |
 
 ## Tests

@@ -572,6 +572,177 @@ def inverse_mape_weights(mape_dict, eps=1e-6):
         return {}
     return {k: v / total for k, v in inv.items()}
 
+def mape_safe(y_pred, y_true):
+    y_pred = np.asarray(y_pred, dtype=float)
+    y_true = np.asarray(y_true, dtype=float)
+    denom = np.where(np.abs(y_true) < 1e-6, 1e-6, np.abs(y_true))
+    return float(np.mean(np.abs(y_pred - y_true) / denom) * 100)
+
+def fit_intermittent_two_stage(y_orig, idx_dt, horizon, future_idx):
+    """Forecast intermittent: P(y>0) x E(y | y>0).
+
+    Si LightGBM est disponible, on entraîne un classifieur occurrence + un
+    régresseur montant positif. Sinon fallback TSB simple.
+    """
+    y_arr = np.asarray(y_orig, dtype=float)
+    y_arr = np.maximum(y_arr, 0.0)
+    occ = (y_arr > 0).astype(float)
+
+    # Fallback TSB : probabilité et montant positif lissés séparément.
+    def tsb(alpha=0.20, beta=0.20):
+        p = float(occ[0]) if len(occ) else 0.0
+        z = float(y_arr[y_arr > 0].mean()) if np.any(y_arr > 0) else 0.0
+        for val, is_pos in zip(y_arr, occ):
+            p = alpha * is_pos + (1.0 - alpha) * p
+            if is_pos:
+                z = beta * val + (1.0 - beta) * z
+        return np.full(horizon, max(p * z, 0.0), dtype=float)
+
+    if not HAS_LGB or len(y_arr) < 140 or occ.sum() < 20:
+        return tsb()
+
+    try:
+        feats = make_lag_features(y_arr, idx_dt)
+        feats["zero_rate_20"] = pd.Series(occ).rolling(20, min_periods=5).mean().values
+        valid = feats.notna().all(axis=1)
+        X = feats.loc[valid].values
+        y_occ = occ[valid.values]
+        y_amt = np.log1p(y_arr[valid.values])
+        if len(np.unique(y_occ)) < 2:
+            return tsb()
+
+        clf = lgb.LGBMClassifier(
+            n_estimators=300, learning_rate=0.03, num_leaves=15,
+            min_data_in_leaf=20, random_state=SEED, verbose=-1,
+        )
+        reg = lgb.LGBMRegressor(
+            n_estimators=300, learning_rate=0.03, num_leaves=15,
+            min_data_in_leaf=20, random_state=SEED, verbose=-1,
+        )
+        clf.fit(X, y_occ)
+        pos_mask = (y_amt > 0)
+        if pos_mask.sum() < 20:
+            return tsb()
+        reg.fit(X[pos_mask], y_amt[pos_mask])
+
+        history = list(y_arr)
+        occ_hist = list(occ)
+        full_idx = idx_dt.append(future_idx)
+        preds = []
+        for _ in range(horizon):
+            arr = np.concatenate([np.asarray(history, dtype=float), [np.nan]])
+            partial = make_lag_features(arr, full_idx[:len(arr)])
+            partial["zero_rate_20"] = (
+                pd.Series(occ_hist + [np.nan])
+                  .rolling(20, min_periods=5).mean().values
+            )
+            x_pred = partial.iloc[-1].values.reshape(1, -1)
+            if np.any(np.isnan(x_pred)):
+                x_pred = np.nan_to_num(x_pred, nan=0.0)
+            prob = float(clf.predict_proba(x_pred)[0, 1])
+            amt = float(np.expm1(reg.predict(x_pred)[0]))
+            yhat = max(prob * amt, 0.0)
+            preds.append(yhat)
+            history.append(yhat)
+            occ_hist.append(float(yhat > 1e-9))
+        return np.asarray(preds, dtype=float)
+    except Exception as e:
+        print(f"  Intermittent two-stage error: {type(e).__name__}: {e}")
+        return tsb()
+
+def forecast_candidate_panel(y_orig_train, idx_train, horizon, idx_future,
+                             y_model_train, exog_train, exog_future,
+                             order, seasonal_order, break_anchor=None,
+                             intermittent=False):
+    """Fit all candidate forecasters on one training window."""
+    panel = {}
+
+    res = fit_sarimax(y_model_train, exog_train, order=order,
+                      seasonal_order=seasonal_order, maxiter=FIT_MAXITER + 100)
+    if res is not None:
+        fc = res.get_forecast(steps=horizon, exog=exog_future)
+        sigma2 = float(np.var(res.resid))
+        panel["SARIMAX_full"] = back_to_original(fc.predicted_mean.values, sigma2)
+
+    if break_anchor is not None:
+        res_pr, _ = fit_sarimax_post_rupture(y_model_train, exog_train,
+                                             break_anchor, order, seasonal_order)
+        if res_pr is not None:
+            fc_pr = res_pr.get_forecast(steps=horizon, exog=exog_future)
+            sigma2_pr = float(np.var(res_pr.resid))
+            panel["SARIMAX_post_rupture"] = back_to_original(
+                fc_pr.predicted_mean.values, sigma2_pr
+            )
+
+    ets_res = fit_ets(pd.Series(y_orig_train, index=idx_train),
+                      seasonal_periods=SEASONAL_PERIOD)
+    if ets_res is not None:
+        panel["ETS"] = np.asarray(ets_res.forecast(horizon), dtype=float)
+
+    yhat_theta = fit_theta_forecast(pd.Series(y_orig_train, index=idx_train), horizon)
+    if yhat_theta is not None:
+        panel["Theta"] = yhat_theta
+
+    yhat_holt = fit_holt_damped_forecast(pd.Series(y_orig_train, index=idx_train), horizon)
+    if yhat_holt is not None:
+        panel["Holt_damped"] = yhat_holt
+
+    yhat_lgb = fit_lightgbm_recursive(y_orig_train, idx_train, horizon, idx_future)
+    if yhat_lgb is not None:
+        panel["LightGBM"] = yhat_lgb
+
+    if intermittent:
+        yhat_int = fit_intermittent_two_stage(y_orig_train, idx_train, horizon, idx_future)
+        if yhat_int is not None:
+            panel["Intermittent_2stage"] = yhat_int
+
+    return {k: np.maximum(np.asarray(v, dtype=float), 0.0) for k, v in panel.items()}
+
+def walk_forward_candidate_mapes(series_orig, y_model, exog, order, seasonal_order,
+                                 break_anchor=None, break_dates=None,
+                                 intermittent=False, folds=WF_FOLDS, val_len=30):
+    """Median MAPE by candidate over rolling-origin folds."""
+    n_total = len(series_orig)
+    train_min = n_total - folds * val_len
+    if train_min < 120:
+        print("Historique trop court pour pondération walk-forward du panel complet.")
+        return {}
+
+    scores = {}
+    for k in range(folds):
+        end_train = train_min + k * val_len
+        y_orig_tr = series_orig.iloc[:end_train].values
+        y_true = series_orig.iloc[end_train:end_train + val_len].values
+        idx_tr = series_orig.index[:end_train]
+        idx_va = series_orig.index[end_train:end_train + val_len]
+        y_mod_tr = y_model.iloc[:end_train]
+        x_tr = exog.iloc[:end_train]
+        x_va = exog.iloc[end_train:end_train + val_len]
+
+        fold_break = break_anchor
+        if break_dates:
+            prior = [d for d in break_dates if pd.Timestamp(d) <= idx_tr[-1]]
+            fold_break = prior[-1] if prior else None
+        elif break_anchor is not None and pd.Timestamp(break_anchor) > idx_tr[-1]:
+            fold_break = None
+
+        panel = forecast_candidate_panel(
+            y_orig_tr, idx_tr, len(y_true), idx_va,
+            y_mod_tr, x_tr, x_va, order, seasonal_order,
+            break_anchor=fold_break, intermittent=intermittent,
+        )
+        for name, pred in panel.items():
+            if len(pred) == len(y_true) and np.all(np.isfinite(pred)):
+                scores.setdefault(name, []).append(mape_safe(pred, y_true))
+
+    med = {name: float(np.median(vals)) for name, vals in scores.items()
+           if len(vals) >= max(2, folds // 2)}
+    if med:
+        print("MAPE médian walk-forward par candidat (pondération ensemble) :")
+        for name, val in sorted(med.items(), key=lambda kv: kv[1]):
+            print(f"  {name:24s} {val:7.3f}%")
+    return med
+
 print(f"Trend-aware forecasters chargés : Theta={HAS_THETA}, LightGBM={HAS_LGB}, "
       f"Holt-damped=True, SARIMAX-post-rupture=True")'''
 
@@ -960,8 +1131,17 @@ def mape(a, b):
 cand_mapes = {n: mape(yhat_, y_test_orig) for n, yhat_ in candidates.items()}
 base_mapes = {n: mape(yhat_, y_test_orig) for n, yhat_ in baselines.items()}
 
-# ── ENSEMBLE pondéré par 1/MAPE (uniquement sur les candidats, pas les baselines) ──
-weights = inverse_mape_weights(cand_mapes)
+# ── ENSEMBLE pondéré par MAPE médian walk-forward du PANEL complet ───────────
+wf_candidate_mapes = walk_forward_candidate_mapes(
+    series, y_target, current_exog, best_order, best_seasonal,
+    break_anchor=break_candidate, intermittent=False,
+    folds=WF_FOLDS, val_len=30,
+)
+weights_source = {k: v for k, v in wf_candidate_mapes.items() if k in candidates}
+if not weights_source:
+    print("⚠ Fallback poids ensemble : hold-out unique (WF panel indisponible)")
+    weights_source = cand_mapes
+weights = inverse_mape_weights(weights_source)
 ensemble_pred = None
 if weights:
     ensemble_pred = np.zeros(HOLDOUT_LEN, dtype=float)
@@ -996,6 +1176,19 @@ if "ENSEMBLE_inv_MAPE" in candidates and cand_mapes["ENSEMBLE_inv_MAPE"] < np.in
 else:
     model_final_label = min(cand_mapes, key=cand_mapes.get) if cand_mapes else "Naive_last"
     yhat = candidates.get(model_final_label, baselines["Naive_last"])
+
+best_baseline_name = min(base_mapes, key=base_mapes.get)
+best_baseline_mape = base_mapes[best_baseline_name]
+candidate_mape_tmp = mape(yhat, y_test_orig)
+gain_vs_best_baseline_tmp = (
+    (best_baseline_mape - candidate_mape_tmp) / max(best_baseline_mape, 1e-6) * 100
+)
+if gain_vs_best_baseline_tmp < MIN_GAIN_VS_NAIVE:
+    print(f"⚠ Gain insuffisant vs meilleur baseline ({best_baseline_name}) : "
+          f"{gain_vs_best_baseline_tmp:+.2f}% < {MIN_GAIN_VS_NAIVE:.1f}%")
+    print("  → Fallback opérationnel sur le baseline.")
+    model_final_label = f"BASELINE_{best_baseline_name}"
+    yhat = baselines[best_baseline_name]
 
 mape_model = mape(yhat, y_test_orig)
 mae_model  = mae(yhat, y_test_orig)
@@ -1126,8 +1319,23 @@ if total_w > 0:
     ensemble_future /= total_w
     future_candidates["ENSEMBLE_inv_MAPE"] = ensemble_future
 
+# Baselines futurs, utilisés si la règle +5% a déclenché le fallback.
+future_baselines = {
+    "BASELINE_Naive_last": np.full(FORECAST_HORIZON, series.values[-1], dtype=float),
+    "BASELINE_RWD": (
+        series.values[-1]
+        + float(np.mean(np.diff(series.values))) * np.arange(1, FORECAST_HORIZON + 1)
+    ),
+    f"BASELINE_Naive_m{SEASONAL_PERIOD}": seasonal_naive_forecast(
+        series.values, FORECAST_HORIZON, season=SEASONAL_PERIOD
+    ),
+}
+
 # Sélection finale = même label que hold-out (en général ENSEMBLE_inv_MAPE)
-if model_final_label in future_candidates:
+if model_final_label in future_baselines:
+    yhat_future = future_baselines[model_final_label]
+    proj_engine = model_final_label
+elif model_final_label in future_candidates:
     yhat_future = future_candidates[model_final_label]
     proj_engine = model_final_label
 elif "ENSEMBLE_inv_MAPE" in future_candidates:
@@ -1280,6 +1488,7 @@ if break_candidate is not None:
 candidates_df = pd.DataFrame([
     {"model": name,
      "holdout_MAPE_pct": cand_mapes.get(name, np.nan),
+     "wf_median_MAPE_pct": wf_candidate_mapes.get(name, np.nan),
      "weight": weights.get(name, 0.0)}
     for name in candidates
 ])
@@ -1546,6 +1755,12 @@ yhat_lgb = fit_lightgbm_recursive(y_train_orig, train_idx_dt, HOLDOUT_LEN, test_
 if yhat_lgb is not None:
     candidates["LightGBM"] = yhat_lgb
 
+# ── (7) Intermittent two-stage : probabilité x montant positif ──────────────
+yhat_int = fit_intermittent_two_stage(y_train_orig, train_idx_dt,
+                                      HOLDOUT_LEN, test_idx_dt)
+if yhat_int is not None:
+    candidates["Intermittent_2stage"] = yhat_int
+
 # ── Baselines ───────────────────────────────────────────────────────────────
 train_q_means = pd.Series(y_train_orig, index=train_idx_dt).groupby(train_idx_dt.quarter).mean()
 yhat_qmean = np.array([train_q_means.get(d.quarter, y_train_orig[-1]) for d in test_idx_dt],
@@ -1567,8 +1782,17 @@ def mape(a, b):
 cand_mapes = {n: mape(yhat_, y_test_orig) for n, yhat_ in candidates.items()}
 base_mapes = {n: mape(yhat_, y_test_orig) for n, yhat_ in baselines.items()}
 
-# ── ENSEMBLE inverse-MAPE ───────────────────────────────────────────────────
-weights = inverse_mape_weights(cand_mapes)
+# ── ENSEMBLE pondéré par MAPE médian walk-forward du PANEL complet ───────────
+wf_candidate_mapes = walk_forward_candidate_mapes(
+    series, y_target, current_exog, best_order, best_seasonal,
+    break_dates=break_dates, intermittent=True,
+    folds=WF_FOLDS, val_len=30,
+)
+weights_source = {k: v for k, v in wf_candidate_mapes.items() if k in candidates}
+if not weights_source:
+    print("⚠ Fallback poids ensemble : hold-out unique (WF panel indisponible)")
+    weights_source = cand_mapes
+weights = inverse_mape_weights(weights_source)
 ensemble_pred = None
 if weights:
     ensemble_pred = np.zeros(HOLDOUT_LEN, dtype=float)
@@ -1603,6 +1827,19 @@ if "ENSEMBLE_inv_MAPE" in candidates and cand_mapes["ENSEMBLE_inv_MAPE"] < np.in
 else:
     model_final_label = min(cand_mapes, key=cand_mapes.get) if cand_mapes else "Naive_last"
     yhat = candidates.get(model_final_label, baselines["Naive_last"])
+
+best_baseline_name = min(base_mapes, key=base_mapes.get)
+best_baseline_mape = base_mapes[best_baseline_name]
+candidate_mape_tmp = mape(yhat, y_test_orig)
+gain_vs_best_baseline_tmp = (
+    (best_baseline_mape - candidate_mape_tmp) / max(best_baseline_mape, 1e-6) * 100
+)
+if gain_vs_best_baseline_tmp < MIN_GAIN_VS_NAIVE:
+    print(f"⚠ Gain insuffisant vs meilleur baseline ({best_baseline_name}) : "
+          f"{gain_vs_best_baseline_tmp:+.2f}% < {MIN_GAIN_VS_NAIVE:.1f}%")
+    print("  → Fallback opérationnel sur le baseline.")
+    model_final_label = f"BASELINE_{best_baseline_name}"
+    yhat = baselines[best_baseline_name]
 
 mape_model = mape(yhat, y_test_orig)
 mae_model  = mae(yhat, y_test_orig)
@@ -1722,6 +1959,13 @@ if "LightGBM" in candidates:
     if yl is not None:
         future_candidates["LightGBM"] = yl
 
+# (7) Intermittent two-stage
+if "Intermittent_2stage" in candidates:
+    yi = fit_intermittent_two_stage(series.values, series.index,
+                                    FORECAST_HORIZON, future_idx)
+    if yi is not None:
+        future_candidates["Intermittent_2stage"] = yi
+
 # Ensemble future = poids hold-out
 ensemble_future = np.zeros(FORECAST_HORIZON, dtype=float)
 total_w = 0.0
@@ -1733,8 +1977,24 @@ if total_w > 0:
     ensemble_future /= total_w
     future_candidates["ENSEMBLE_inv_MAPE"] = ensemble_future
 
+# Baselines futurs, utilisés si la règle +5% a déclenché le fallback.
+full_q_means = series.groupby(series.index.quarter).mean()
+future_baselines = {
+    "BASELINE_Naive_last": np.full(FORECAST_HORIZON, series.values[-1], dtype=float),
+    "BASELINE_Quarterly_mean": np.array(
+        [full_q_means.get(d.quarter, series.values[-1]) for d in future_idx],
+        dtype=float,
+    ),
+    f"BASELINE_Naive_m{SEASONAL_PERIOD}": seasonal_naive_forecast(
+        series.values, FORECAST_HORIZON, season=SEASONAL_PERIOD
+    ),
+}
+
 # Choix du moteur
-if model_final_label in future_candidates:
+if model_final_label in future_baselines:
+    yhat_future = future_baselines[model_final_label]
+    proj_engine = model_final_label
+elif model_final_label in future_candidates:
     yhat_future = future_candidates[model_final_label]
     proj_engine = model_final_label
 elif "ENSEMBLE_inv_MAPE" in future_candidates:
@@ -1882,6 +2142,7 @@ else:
 candidates_df = pd.DataFrame([
     {"model": name,
      "holdout_MAPE_pct": cand_mapes.get(name, np.nan),
+     "wf_median_MAPE_pct": wf_candidate_mapes.get(name, np.nan),
      "weight": weights.get(name, 0.0)}
     for name in candidates
 ])
