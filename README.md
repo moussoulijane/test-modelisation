@@ -13,6 +13,16 @@ La sélection finale combine désormais plusieurs candidats (SARIMAX full, SARIM
 
 Pour les crédits équipement, un modèle intermittent deux étages est ajouté : probabilité de décaissement × montant conditionnel positif. Si `lightgbm` n'est pas installé ou si l'échantillon est trop court, il bascule automatiquement sur un lissage TSB simple.
 
+Les notebooks robustes intègrent aussi une logique **peak-aware** :
+
+- modèles analogues historiques KNN (`KNN_analog_paths`) ;
+- replay de forme récente (`Recent_shape_replay`) ;
+- overlay de facteurs calendaires de pics (`Peak_calendar_overlay`) ;
+- hybrides `SoftPeak_*` pour injecter des pics sans détruire la MAPE ;
+- métriques dédiées : `holdout_peak_wMAPE`, `holdout_peak_capture`, `holdout_score` ;
+- garde-fou : un modèle peak-aware n'est retenu que s'il améliore le score décisionnel sans dégrader la MAPE globale de plus de 25 % vs baseline ;
+- projection avec deux lectures : `forecast` retenu et `peak_scenario_forecast` pour le scénario de pic.
+
 ## Structure
 
 ```

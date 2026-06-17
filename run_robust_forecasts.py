@@ -11,6 +11,10 @@ config = ForecastConfig(
     wf_folds=5,
     wf_horizon=30,
     min_gain_vs_baseline_pct=5.0,
+    peak_quantile=0.80,
+    peak_metric_weight=0.45,
+    peak_weight_multiplier=4.0,
+    max_mape_degradation_vs_baseline_pct=25.0,
 )
 
 run_bundle(

@@ -45,6 +45,10 @@ class ForecastConfig:
     min_gain_vs_baseline_pct: float = 5.0
     top_n_ensemble: int = 3
     alpha: float = 0.05
+    peak_quantile: float = 0.80
+    peak_metric_weight: float = 0.45
+    peak_weight_multiplier: float = 4.0
+    max_mape_degradation_vs_baseline_pct: float = 25.0
 
 
 @dataclass
@@ -133,6 +137,83 @@ def mase(y_true: np.ndarray, y_pred: np.ndarray, y_train: np.ndarray, season: in
         scale = np.mean(np.abs(np.diff(y_train)))
     scale = max(float(scale), 1e-9)
     return float(np.mean(np.abs(np.asarray(y_true) - np.asarray(y_pred))) / scale)
+
+
+def peak_threshold(y_train: pd.Series | np.ndarray, quantile: float) -> float:
+    vals = np.asarray(y_train, dtype=float)
+    return float(np.quantile(vals[np.isfinite(vals)], quantile))
+
+
+def local_spike_threshold(y_train: pd.Series | np.ndarray, quantile: float) -> float:
+    vals = pd.Series(np.asarray(y_train, dtype=float))
+    local_base = vals.rolling(20, min_periods=8).median().bfill()
+    excess = (vals - local_base).replace([np.inf, -np.inf], np.nan).dropna()
+    if excess.empty:
+        return 0.0
+    return max(float(np.quantile(excess, quantile)), 0.0)
+
+
+def local_spike_reference(y_train: pd.Series | np.ndarray, horizon: int) -> np.ndarray:
+    vals = np.asarray(y_train, dtype=float)
+    drift = float(np.mean(np.diff(vals))) if len(vals) > 1 else 0.0
+    return vals[-1] + drift * np.arange(1, horizon + 1)
+
+
+def local_spike_mask(
+    y_values: np.ndarray,
+    y_train: pd.Series | np.ndarray,
+    quantile: float,
+) -> np.ndarray:
+    y_values = np.asarray(y_values, dtype=float)
+    ref = local_spike_reference(y_train, len(y_values))
+    threshold = local_spike_threshold(y_train, quantile)
+    return (y_values - ref) >= threshold
+
+
+def peak_weighted_mape(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_train: pd.Series | np.ndarray,
+    quantile: float,
+    peak_multiplier: float,
+) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    peak_mask = local_spike_mask(y_true, y_train, quantile)
+    weights = np.ones_like(y_true, dtype=float)
+    weights[peak_mask] = peak_multiplier
+    denom = np.where(np.abs(y_true) < 1e-9, np.nan, np.abs(y_true))
+    ape = np.abs(y_true - y_pred) / denom * 100
+    return float(np.nansum(weights * ape) / np.nansum(weights))
+
+
+def peak_capture_rate(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_train: pd.Series | np.ndarray,
+    quantile: float,
+) -> float:
+    actual_peak = local_spike_mask(y_true, y_train, quantile)
+    if actual_peak.sum() == 0:
+        return np.nan
+    predicted_peak = local_spike_mask(y_pred, y_train, quantile)
+    return float((actual_peak & predicted_peak).sum() / actual_peak.sum())
+
+
+def balanced_model_score(
+    mape_value: float,
+    peak_mape_value: float,
+    peak_capture_value: float,
+    config: ForecastConfig,
+) -> float:
+    capture_penalty = 0.0
+    if np.isfinite(peak_capture_value):
+        capture_penalty = max(0.0, 0.50 - peak_capture_value) * 4.0
+    return float(
+        (1.0 - config.peak_metric_weight) * mape_value
+        + config.peak_metric_weight * peak_mape_value
+        + capture_penalty
+    )
 
 
 def seasonal_naive(y_train: pd.Series, horizon: int, season: int = 5) -> np.ndarray:
@@ -224,6 +305,101 @@ def fit_ucm(y_train: pd.Series, horizon: int) -> np.ndarray | None:
             return None
 
 
+def fit_knn_analog_paths(
+    y_train: pd.Series,
+    horizon: int,
+    future_index: pd.DatetimeIndex,
+    window: int = 30,
+    k: int = 8,
+) -> np.ndarray | None:
+    """Historical analog paths.
+
+    Looks for past windows shaped like the most recent window and replays the
+    following path, scaled to today's level. This is deliberately peak-aware:
+    if similar historical contexts were followed by spikes, the forecast path
+    can contain spikes instead of collapsing to a straight line.
+    """
+    vals = y_train.values.astype(float)
+    n = len(vals)
+    if n < window + horizon + 80:
+        return None
+
+    current = vals[-window:]
+    cur_scale = max(float(np.mean(current)), 1e-9)
+    current_shape = current / cur_scale - 1.0
+    candidates = []
+    for start in range(window, n - horizon):
+        past = vals[start - window : start]
+        future = vals[start : start + horizon]
+        past_scale = max(float(np.mean(past)), 1e-9)
+        past_shape = past / past_scale - 1.0
+        shape_dist = float(np.sqrt(np.mean((current_shape - past_shape) ** 2)))
+        dow_penalty = 0.02 * abs(int(y_train.index[start].dayofweek) - int(future_index[0].dayofweek))
+        dist = shape_dist + dow_penalty
+        scale = vals[-1] / max(past[-1], 1e-9)
+        candidates.append((dist, future * scale))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    chosen = candidates[:k]
+    weights = np.array([1.0 / max(d, 1e-6) for d, _ in chosen], dtype=float)
+    weights = weights / weights.sum()
+    out = np.zeros(horizon, dtype=float)
+    for w, (_, path) in zip(weights, chosen):
+        out += w * path
+    return np.maximum(out, 0.0)
+
+
+def _calendar_bucket(index: pd.DatetimeIndex) -> pd.Series:
+    days = pd.Series(index.day, index=index)
+    return pd.cut(days, bins=[0, 5, 10, 15, 20, 25, 31], labels=False, include_lowest=True)
+
+
+def fit_peak_calendar_overlay(y_train: pd.Series, horizon: int, future_index: pd.DatetimeIndex) -> np.ndarray | None:
+    """Drift forecast multiplied by robust calendar peak factors."""
+    if len(y_train) < 160:
+        return None
+    base_hist = y_train.rolling(20, min_periods=10).median().bfill()
+    ratio = (y_train / base_hist).replace([np.inf, -np.inf], np.nan).dropna()
+    if ratio.empty:
+        return None
+
+    train_idx = ratio.index
+    dow_effect = ratio.groupby(train_idx.dayofweek).median()
+    dom_effect = ratio.groupby(_calendar_bucket(train_idx)).median()
+    eom_effect = ratio.groupby(train_idx.day >= 25).median()
+    eoq_mask = train_idx.month.isin([3, 6, 9, 12]) & (train_idx.day >= 20)
+    eoq_effect = ratio.groupby(eoq_mask).median()
+
+    baseline = drift_forecast(y_train, horizon)
+    factors = []
+    future_bucket = _calendar_bucket(future_index)
+    for i, d in enumerate(future_index):
+        pieces = [
+            float(dow_effect.get(d.dayofweek, 1.0)),
+            float(dom_effect.get(future_bucket.iloc[i], 1.0)),
+            float(eom_effect.get(d.day >= 25, 1.0)),
+            float(eoq_effect.get(d.month in [3, 6, 9, 12] and d.day >= 20, 1.0)),
+        ]
+        factor = 0.35 * pieces[0] + 0.25 * pieces[1] + 0.25 * pieces[2] + 0.15 * pieces[3]
+        factors.append(float(np.clip(factor, 0.90, 1.12)))
+    return np.maximum(baseline * np.asarray(factors), 0.0)
+
+
+def fit_recent_shape_replay(y_train: pd.Series, horizon: int, pattern: int = 20) -> np.ndarray | None:
+    """Replay the recent local shape on top of a drift baseline."""
+    if len(y_train) < pattern + 80:
+        return None
+    baseline = drift_forecast(y_train, horizon)
+    hist_base = drift_forecast(y_train.iloc[:-pattern], pattern)
+    recent = y_train.iloc[-pattern:].values.astype(float)
+    ratios = recent / np.maximum(hist_base, 1e-9)
+    ratios = np.clip(ratios, 0.88, 1.14)
+    repeated = np.resize(ratios, horizon)
+    return np.maximum(baseline * repeated, 0.0)
+
+
 def model_forecasts(y_train: pd.Series, horizon: int, future_index: pd.DatetimeIndex) -> dict[str, np.ndarray]:
     forecasts: dict[str, np.ndarray] = {
         "BASELINE_last": np.full(horizon, y_train.iloc[-1], dtype=float),
@@ -235,11 +411,18 @@ def model_forecasts(y_train: pd.Series, horizon: int, future_index: pd.DatetimeI
         "ETS_damped": lambda: fit_ets(y_train, horizon),
         "Theta": lambda: fit_theta(y_train, horizon),
         "UCM_local_linear": lambda: fit_ucm(y_train, horizon),
+        "KNN_analog_paths": lambda: fit_knn_analog_paths(y_train, horizon, future_index),
+        "Peak_calendar_overlay": lambda: fit_peak_calendar_overlay(y_train, horizon, future_index),
+        "Recent_shape_replay": lambda: fit_recent_shape_replay(y_train, horizon),
     }
     for name, func in candidates.items():
         pred = func()
         if pred is not None and len(pred) == horizon and np.all(np.isfinite(pred)):
             forecasts[name] = np.maximum(pred.astype(float), 0.0)
+    anchor = 0.50 * forecasts["BASELINE_last"] + 0.50 * forecasts["BASELINE_drift"]
+    for name in ["UCM_local_linear", "KNN_analog_paths", "Peak_calendar_overlay", "Recent_shape_replay"]:
+        if name in forecasts:
+            forecasts[f"SoftPeak_{name}"] = np.maximum(0.65 * anchor + 0.35 * forecasts[name], 0.0)
     return forecasts
 
 
@@ -256,20 +439,44 @@ def evaluate_walk_forward(y: pd.Series, config: ForecastConfig) -> pd.DataFrame:
         future_idx = y_true.index
         forecasts = model_forecasts(y_train, len(y_true), future_idx)
         for model_name, pred in forecasts.items():
+            mape_value = mape(y_true.values, pred)
+            peak_mape_value = peak_weighted_mape(
+                y_true.values,
+                pred,
+                y_train.values,
+                config.peak_quantile,
+                config.peak_weight_multiplier,
+            )
+            peak_capture_value = peak_capture_rate(
+                y_true.values,
+                pred,
+                y_train.values,
+                config.peak_quantile,
+            )
             rows.append(
                 {
                     "fold": fold + 1,
                     "model": model_name,
-                    "MAPE": mape(y_true.values, pred),
+                    "MAPE": mape_value,
                     "sMAPE": smape(y_true.values, pred),
                     "MASE": mase(y_true.values, pred, y_train.values, config.seasonal_period),
+                    "peak_wMAPE": peak_mape_value,
+                    "peak_capture": peak_capture_value,
+                    "score": balanced_model_score(mape_value, peak_mape_value, peak_capture_value, config),
                 }
             )
     wf = pd.DataFrame(rows)
     med = (
         wf.groupby("model", as_index=False)
-        .agg(wf_MAPE_median=("MAPE", "median"), wf_MAPE_mean=("MAPE", "mean"), wf_MASE_median=("MASE", "median"))
-        .sort_values("wf_MAPE_median")
+        .agg(
+            wf_MAPE_median=("MAPE", "median"),
+            wf_peak_wMAPE_median=("peak_wMAPE", "median"),
+            wf_peak_capture_mean=("peak_capture", "mean"),
+            wf_score_median=("score", "median"),
+            wf_MAPE_mean=("MAPE", "mean"),
+            wf_MASE_median=("MASE", "median"),
+        )
+        .sort_values("wf_score_median")
         .reset_index(drop=True)
     )
     return med
@@ -277,11 +484,12 @@ def evaluate_walk_forward(y: pd.Series, config: ForecastConfig) -> pd.DataFrame:
 
 def inverse_mape_weights(candidate_scores: pd.DataFrame, top_n: int) -> dict[str, float]:
     non_base = candidate_scores[~candidate_scores["model"].str.startswith("BASELINE_")].copy()
-    non_base = non_base.replace([np.inf, -np.inf], np.nan).dropna(subset=["wf_MAPE_median"])
-    non_base = non_base.sort_values("wf_MAPE_median").head(top_n)
+    score_col = "wf_score_median" if "wf_score_median" in non_base.columns else "wf_MAPE_median"
+    non_base = non_base.replace([np.inf, -np.inf], np.nan).dropna(subset=[score_col])
+    non_base = non_base.sort_values(score_col).head(top_n)
     if non_base.empty:
         return {}
-    inv = 1.0 / np.maximum(non_base["wf_MAPE_median"].values, 1e-6)
+    inv = 1.0 / np.maximum(non_base[score_col].values, 1e-6)
     inv = inv / inv.sum()
     return {m: float(w) for m, w in zip(non_base["model"], inv)}
 
@@ -343,27 +551,78 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
 
     holdout_rows = []
     for name, pred in holdout_forecasts.items():
+        mape_value = mape(holdout.values, pred)
+        peak_mape_value = peak_weighted_mape(
+            holdout.values,
+            pred,
+            train.values,
+            config.peak_quantile,
+            config.peak_weight_multiplier,
+        )
+        peak_capture_value = peak_capture_rate(
+            holdout.values,
+            pred,
+            train.values,
+            config.peak_quantile,
+        )
         holdout_rows.append(
             {
                 "model": name,
-                "holdout_MAPE": mape(holdout.values, pred),
+                "holdout_MAPE": mape_value,
                 "holdout_sMAPE": smape(holdout.values, pred),
                 "holdout_MAE": mae(holdout.values, pred),
                 "holdout_RMSE": rmse(holdout.values, pred),
                 "holdout_MASE": mase(holdout.values, pred, train.values, config.seasonal_period),
+                "holdout_peak_wMAPE": peak_mape_value,
+                "holdout_peak_capture": peak_capture_value,
+                "holdout_score": balanced_model_score(
+                    mape_value,
+                    peak_mape_value,
+                    peak_capture_value,
+                    config,
+                ),
             }
         )
-    holdout_scores = pd.DataFrame(holdout_rows).sort_values("holdout_MAPE").reset_index(drop=True)
+    holdout_scores = pd.DataFrame(holdout_rows).sort_values("holdout_score").reset_index(drop=True)
 
-    best_baseline = holdout_scores[holdout_scores["model"].str.startswith("BASELINE_")].iloc[0]
-    if "ENSEMBLE_wf_top" in holdout_forecasts:
-        proposed_model = "ENSEMBLE_wf_top"
-    else:
-        proposed_model = holdout_scores[~holdout_scores["model"].str.startswith("BASELINE_")].iloc[0]["model"]
+    best_baseline = (
+        holdout_scores[holdout_scores["model"].str.startswith("BASELINE_")]
+        .sort_values("holdout_score")
+        .iloc[0]
+    )
+    non_baseline_scores = (
+        holdout_scores[~holdout_scores["model"].str.startswith("BASELINE_")]
+        .sort_values("holdout_score")
+        .reset_index(drop=True)
+    )
+    proposed_model = non_baseline_scores.iloc[0]["model"]
+    proposed_score = float(holdout_scores.loc[holdout_scores["model"] == proposed_model, "holdout_score"].iloc[0])
     proposed_mape = float(holdout_scores.loc[holdout_scores["model"] == proposed_model, "holdout_MAPE"].iloc[0])
+    baseline_score = float(best_baseline["holdout_score"])
     baseline_mape = float(best_baseline["holdout_MAPE"])
-    gain = (baseline_mape - proposed_mape) / max(baseline_mape, 1e-9) * 100
-    final_model = proposed_model if gain >= config.min_gain_vs_baseline_pct else str(best_baseline["model"])
+    gain = (baseline_score - proposed_score) / max(baseline_score, 1e-9) * 100
+    mape_degradation = (proposed_mape - baseline_mape) / max(baseline_mape, 1e-9) * 100
+    final_model = str(best_baseline["model"])
+    for _, row in non_baseline_scores.iterrows():
+        row_score = float(row["holdout_score"])
+        row_mape = float(row["holdout_MAPE"])
+        row_gain = (baseline_score - row_score) / max(baseline_score, 1e-9) * 100
+        row_mape_degradation = (row_mape - baseline_mape) / max(baseline_mape, 1e-9) * 100
+        if (
+            row_gain >= config.min_gain_vs_baseline_pct
+            and row_mape_degradation <= config.max_mape_degradation_vs_baseline_pct
+        ):
+            final_model = str(row["model"])
+            break
+
+    peak_candidates = non_baseline_scores.copy()
+    peak_candidates["capture_rank"] = peak_candidates["holdout_peak_capture"].fillna(-1.0)
+    peak_scenario_model = str(
+        peak_candidates.sort_values(
+            ["capture_rank", "holdout_peak_wMAPE", "holdout_score"],
+            ascending=[False, True, True],
+        ).iloc[0]["model"]
+    )
 
     future_idx = ma_business_days(y.index[-1] + pd.Timedelta(days=1), config.forecast_horizon)
     future_forecasts = model_forecasts(y, config.forecast_horizon, future_idx)
@@ -373,6 +632,7 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
     if final_model not in future_forecasts:
         final_model = str(best_baseline["model"])
     yhat_future = future_forecasts[final_model]
+    peak_scenario_future = future_forecasts.get(peak_scenario_model, yhat_future)
 
     holdout_pred = holdout_forecasts[final_model] if final_model in holdout_forecasts else holdout_forecasts[str(best_baseline["model"])]
     residuals = holdout.values - holdout_pred
@@ -382,12 +642,24 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
     horizon_scale = np.clip(horizon_scale, 1.0, 2.0)
     lo = np.maximum(yhat_future + q_lo * horizon_scale, 0.0)
     hi = np.maximum(yhat_future + q_hi * horizon_scale, 0.0)
+    threshold = peak_threshold(y, config.peak_quantile)
+    local_threshold = local_spike_threshold(y, config.peak_quantile)
+    future_reference = local_spike_reference(y, config.forecast_horizon)
+    peak_risk = np.select(
+        [
+            (yhat_future - future_reference) >= local_threshold,
+            (hi - future_reference) >= local_threshold,
+        ],
+        ["high", "watch"],
+        default="normal",
+    )
 
     projection = pd.DataFrame(
         {
             "date": future_idx,
             "target": target,
             "forecast": yhat_future,
+            "peak_scenario_forecast": peak_scenario_future,
             "ic_low": lo,
             "ic_high": hi,
             "reliability": np.select(
@@ -399,6 +671,11 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
                 default="low",
             ),
             "model": final_model,
+            "peak_scenario_model": peak_scenario_model,
+            "level_peak_threshold": threshold,
+            "local_spike_threshold": local_threshold,
+            "local_reference": future_reference,
+            "peak_risk": peak_risk,
             "day_of_week": future_idx.day_name(),
             "is_fixed_ma_holiday": [is_ma_holiday(d) for d in future_idx],
         }
@@ -412,13 +689,15 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
             "prediction": holdout_pred,
             "error": holdout.values - holdout_pred,
             "abs_pct_error": np.abs(holdout.values - holdout_pred) / np.maximum(np.abs(holdout.values), 1e-9) * 100,
+            "actual_peak": local_spike_mask(holdout.values, train.values, config.peak_quantile),
+            "predicted_peak": local_spike_mask(holdout_pred, train.values, config.peak_quantile),
             "model": final_model,
         }
     )
 
     candidates = holdout_scores.merge(wf_scores, on="model", how="outer")
     candidates["ensemble_weight"] = candidates["model"].map(weights).fillna(0.0)
-    candidates = candidates.sort_values(["holdout_MAPE", "wf_MAPE_median"], na_position="last")
+    candidates = candidates.sort_values(["holdout_score", "wf_score_median"], na_position="last")
 
     final_metrics = holdout_scores.loc[holdout_scores["model"] == final_model].iloc[0]
     diagnostics = pd.DataFrame(
@@ -426,10 +705,16 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
             {"metric": "target", "value": target},
             {"metric": "final_model", "value": final_model},
             {"metric": "proposed_model", "value": proposed_model},
+            {"metric": "peak_scenario_model", "value": peak_scenario_model},
             {"metric": "best_baseline", "value": best_baseline["model"]},
             {"metric": "gain_vs_best_baseline_pct", "value": gain},
+            {"metric": "mape_degradation_vs_best_baseline_pct", "value": mape_degradation},
             {"metric": "min_required_gain_pct", "value": config.min_gain_vs_baseline_pct},
+            {"metric": "max_allowed_mape_degradation_pct", "value": config.max_mape_degradation_vs_baseline_pct},
             {"metric": "holdout_MAPE", "value": final_metrics["holdout_MAPE"]},
+            {"metric": "holdout_peak_wMAPE", "value": final_metrics["holdout_peak_wMAPE"]},
+            {"metric": "holdout_peak_capture", "value": final_metrics["holdout_peak_capture"]},
+            {"metric": "holdout_score", "value": final_metrics["holdout_score"]},
             {"metric": "holdout_sMAPE", "value": final_metrics["holdout_sMAPE"]},
             {"metric": "holdout_MAE", "value": final_metrics["holdout_MAE"]},
             {"metric": "holdout_RMSE", "value": final_metrics["holdout_RMSE"]},

@@ -72,6 +72,10 @@ config = ForecastConfig(
     wf_folds=5,
     wf_horizon=30,
     min_gain_vs_baseline_pct=5.0,
+    peak_quantile=0.80,
+    peak_metric_weight=0.45,
+    peak_weight_multiplier=4.0,
+    max_mape_degradation_vs_baseline_pct=25.0,
 )
 
 targets = [
@@ -110,9 +114,14 @@ for result in results:
         "serie": result.target,
         "modele_retenu": diag["final_model"],
         "modele_propose": diag["proposed_model"],
+        "modele_scenario_pic": diag["peak_scenario_model"],
         "meilleur_baseline": diag["best_baseline"],
         "mape_holdout": diag["holdout_MAPE"],
+        "peak_wmape_holdout": diag["holdout_peak_wMAPE"],
+        "peak_capture": diag["holdout_peak_capture"],
+        "score_decision": diag["holdout_score"],
         "gain_vs_baseline_pct": diag["gain_vs_best_baseline_pct"],
+        "mape_degradation_vs_baseline_pct": diag["mape_degradation_vs_best_baseline_pct"],
     })
 summary = pd.DataFrame(summary_rows)
 display(summary)
@@ -131,8 +140,12 @@ for result in results:
             """\
 for result in results:
     print("\\n", result.target)
-    cols = ["model", "holdout_MAPE", "wf_MAPE_median", "ensemble_weight"]
-    display(result.candidates[cols].sort_values("holdout_MAPE"))
+    cols = [
+        "model", "holdout_score", "holdout_MAPE", "holdout_peak_wMAPE",
+        "holdout_peak_capture", "wf_score_median", "wf_peak_wMAPE_median",
+        "wf_peak_capture_mean", "ensemble_weight"
+    ]
+    display(result.candidates[cols].sort_values("holdout_score"))
 """
         ),
     ]
@@ -155,6 +168,10 @@ config = ForecastConfig(
     wf_folds=5,
     wf_horizon=30,
     min_gain_vs_baseline_pct=5.0,
+    peak_quantile=0.80,
+    peak_metric_weight=0.45,
+    peak_weight_multiplier=4.0,
+    max_mape_degradation_vs_baseline_pct=25.0,
 )
 
 targets = ["Credit Décaissement_crédits à lequipement"]
@@ -190,9 +207,14 @@ for result in results:
         "serie": result.target,
         "modele_retenu": diag["final_model"],
         "modele_propose": diag["proposed_model"],
+        "modele_scenario_pic": diag["peak_scenario_model"],
         "meilleur_baseline": diag["best_baseline"],
         "mape_holdout": diag["holdout_MAPE"],
+        "peak_wmape_holdout": diag["holdout_peak_wMAPE"],
+        "peak_capture": diag["holdout_peak_capture"],
+        "score_decision": diag["holdout_score"],
         "gain_vs_baseline_pct": diag["gain_vs_best_baseline_pct"],
+        "mape_degradation_vs_baseline_pct": diag["mape_degradation_vs_best_baseline_pct"],
     })
 summary = pd.DataFrame(summary_rows)
 display(summary)
@@ -209,8 +231,12 @@ for result in results:
         code(
             """\
 for result in results:
-    cols = ["model", "holdout_MAPE", "wf_MAPE_median", "ensemble_weight"]
-    display(result.candidates[cols].sort_values("holdout_MAPE"))
+    cols = [
+        "model", "holdout_score", "holdout_MAPE", "holdout_peak_wMAPE",
+        "holdout_peak_capture", "wf_score_median", "wf_peak_wMAPE_median",
+        "wf_peak_capture_mean", "ensemble_weight"
+    ]
+    display(result.candidates[cols].sort_values("holdout_score"))
 """
         ),
     ]
