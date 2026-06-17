@@ -4,6 +4,8 @@ Deux notebooks Jupyter autonomes pour projeter à 90 jours :
 
 - **`modelisation_comptes_cheques.ipynb`** — série `Credit Décaissement_comptes chèques`
 - **`modelisation_credits_equipement.ipynb`** — série `Credit Décaissement_crédits à lequipement`
+- **`robust_depots_cheques_courants.ipynb`** — dépôts comptes chèques, comptes courants, et total chèques+courants
+- **`robust_credit_equipement.ipynb`** — crédit à l'équipement
 
 Chaque notebook : EDA, tests de stationnarité (ADF/KPSS), détection automatique des ruptures et outliers, SARIMAX avec exogènes calendaires, sélection d'ordre par walk-forward MAPE, diagnostic résidus, hold-out 60 j, panel multi-modèles, projection 90 j avec intervalles de confiance empiriques asymétriques, et export Excel.
 
@@ -19,6 +21,11 @@ Pour les crédits équipement, un modèle intermittent deux étages est ajouté 
 ├── out/                                      # graphiques + projection_robuste_*.xlsx générés
 ├── modelisation_comptes_cheques.ipynb
 ├── modelisation_credits_equipement.ipynb
+├── robust_depots_cheques_courants.ipynb
+├── robust_credit_equipement.ipynb
+├── robust_forecast_engine.py                 # moteur commun pour les notebooks robustes
+├── run_robust_forecasts.py                   # exécution batch des deux nouveaux notebooks
+├── build_robust_notebooks.py                 # régénère les deux notebooks robustes
 └── build_notebooks.py                        # générateur (pour reproduire les .ipynb)
 ```
 
@@ -51,4 +58,6 @@ lightgbm  # optionnel, active les modèles ML et intermittent avancé
 
 ```bash
 python build_notebooks.py        # régénère les deux .ipynb à partir de la spec
+python build_robust_notebooks.py # régénère les deux notebooks robustes
+python run_robust_forecasts.py   # exécute la pipeline robuste sur in/reserve_in.xlsx
 ```
