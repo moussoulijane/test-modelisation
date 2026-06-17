@@ -590,6 +590,11 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
         .sort_values("holdout_score")
         .iloc[0]
     )
+    best_mape_baseline = (
+        holdout_scores[holdout_scores["model"].str.startswith("BASELINE_")]
+        .sort_values("holdout_MAPE")
+        .iloc[0]
+    )
     non_baseline_scores = (
         holdout_scores[~holdout_scores["model"].str.startswith("BASELINE_")]
         .sort_values("holdout_score")
@@ -599,10 +604,10 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
     proposed_score = float(holdout_scores.loc[holdout_scores["model"] == proposed_model, "holdout_score"].iloc[0])
     proposed_mape = float(holdout_scores.loc[holdout_scores["model"] == proposed_model, "holdout_MAPE"].iloc[0])
     baseline_score = float(best_baseline["holdout_score"])
-    baseline_mape = float(best_baseline["holdout_MAPE"])
+    baseline_mape = float(best_mape_baseline["holdout_MAPE"])
     gain = (baseline_score - proposed_score) / max(baseline_score, 1e-9) * 100
     mape_degradation = (proposed_mape - baseline_mape) / max(baseline_mape, 1e-9) * 100
-    final_model = str(best_baseline["model"])
+    final_model = str(best_mape_baseline["model"])
     for _, row in non_baseline_scores.iterrows():
         row_score = float(row["holdout_score"])
         row_mape = float(row["holdout_MAPE"])
@@ -630,11 +635,15 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
     if ensemble_future is not None:
         future_forecasts["ENSEMBLE_wf_top"] = ensemble_future
     if final_model not in future_forecasts:
-        final_model = str(best_baseline["model"])
+        final_model = str(best_mape_baseline["model"])
     yhat_future = future_forecasts[final_model]
     peak_scenario_future = future_forecasts.get(peak_scenario_model, yhat_future)
 
-    holdout_pred = holdout_forecasts[final_model] if final_model in holdout_forecasts else holdout_forecasts[str(best_baseline["model"])]
+    holdout_pred = (
+        holdout_forecasts[final_model]
+        if final_model in holdout_forecasts
+        else holdout_forecasts[str(best_mape_baseline["model"])]
+    )
     residuals = holdout.values - holdout_pred
     q_lo = float(np.quantile(residuals, config.alpha / 2))
     q_hi = float(np.quantile(residuals, 1 - config.alpha / 2))
@@ -707,6 +716,7 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
             {"metric": "proposed_model", "value": proposed_model},
             {"metric": "peak_scenario_model", "value": peak_scenario_model},
             {"metric": "best_baseline", "value": best_baseline["model"]},
+            {"metric": "best_mape_baseline", "value": best_mape_baseline["model"]},
             {"metric": "gain_vs_best_baseline_pct", "value": gain},
             {"metric": "mape_degradation_vs_best_baseline_pct", "value": mape_degradation},
             {"metric": "min_required_gain_pct", "value": config.min_gain_vs_baseline_pct},
