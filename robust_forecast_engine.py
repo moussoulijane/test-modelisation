@@ -14,6 +14,16 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.statespace.structural import UnobservedComponents
 
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    HAS_PLOTLY = True
+except Exception:
+    go = None
+    make_subplots = None
+    HAS_PLOTLY = False
+
 
 np.random.seed(42)
 warnings.filterwarnings("ignore")
@@ -806,6 +816,275 @@ def plot_result(result: ForecastResult, history: pd.Series, output_dir: Path, pr
     return path
 
 
+def create_visualization_dashboard(results: list[ForecastResult], output_dir: Path, prefix: str) -> Path | None:
+    """Interactive bundle-level dashboard inspired by the legacy pipeline."""
+    if not HAS_PLOTLY:
+        print("Plotly unavailable: interactive dashboard skipped.")
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for result in results:
+        diag = result.diagnostics.set_index("metric")["value"]
+        rows.append(
+            {
+                "target": result.target,
+                "model": result.final_model,
+                "mape": float(diag.get("holdout_MAPE", np.nan)),
+                "peak_wmape": float(diag.get("holdout_peak_wMAPE", np.nan)),
+                "peak_capture": float(diag.get("holdout_peak_capture", np.nan)),
+                "score": float(diag.get("holdout_score", np.nan)),
+                "gain": float(diag.get("gain_vs_best_baseline_pct", np.nan)),
+            }
+        )
+    summary = pd.DataFrame(rows)
+    if summary.empty:
+        return None
+
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=(
+            "MAPE hold-out par serie",
+            "Score decisionnel peak-aware",
+            "Capture des pics locaux",
+            "Modele retenu",
+        ),
+        specs=[[{"type": "bar"}, {"type": "bar"}], [{"type": "bar"}, {"type": "bar"}]],
+        vertical_spacing=0.16,
+        horizontal_spacing=0.10,
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=summary["target"],
+            y=summary["mape"],
+            text=[f"{v:.2f}%" for v in summary["mape"]],
+            textposition="auto",
+            marker_color="#1F4E78",
+            name="MAPE",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=summary["target"],
+            y=summary["score"],
+            text=[f"{v:.2f}" for v in summary["score"]],
+            textposition="auto",
+            marker_color="#2E75B5",
+            name="Score",
+        ),
+        row=1,
+        col=2,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=summary["target"],
+            y=summary["peak_capture"],
+            text=[
+                "n/a" if not np.isfinite(v) else f"{100 * v:.0f}%"
+                for v in summary["peak_capture"]
+            ],
+            textposition="auto",
+            marker_color="#70AD47",
+            name="Peak capture",
+        ),
+        row=2,
+        col=1,
+    )
+    model_counts = summary["model"].value_counts().reset_index()
+    model_counts.columns = ["model", "count"]
+    fig.add_trace(
+        go.Bar(
+            x=model_counts["model"],
+            y=model_counts["count"],
+            text=model_counts["count"],
+            textposition="auto",
+            marker_color="#9E480E",
+            name="Model count",
+        ),
+        row=2,
+        col=2,
+    )
+
+    fig.update_layout(
+        title=f"Dashboard forecast robuste - {prefix}",
+        template="plotly_white",
+        height=850,
+        showlegend=False,
+        margin=dict(l=50, r=30, t=90, b=120),
+    )
+    fig.update_xaxes(tickangle=-30)
+
+    path = output_dir / f"dashboard_{prefix}.html"
+    fig.write_html(path)
+    return path
+
+
+def create_individual_interactive_chart(
+    result: ForecastResult,
+    history: pd.Series,
+    output_dir: Path,
+    prefix: str,
+) -> Path | None:
+    """Interactive per-series chart: history/projection + residual diagnostics."""
+    if not HAS_PLOTLY:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hist_tail = history.iloc[-300:]
+    residuals = result.holdout["actual"] - result.holdout["prediction"]
+    diag = result.diagnostics.set_index("metric")["value"]
+    mape_value = float(diag.get("holdout_MAPE", np.nan))
+    peak_capture = diag.get("holdout_peak_capture", np.nan)
+    peak_text = "n/a" if not np.isfinite(float(peak_capture)) else f"{100 * float(peak_capture):.0f}%"
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        subplot_titles=(
+            f"{result.target} - historique, hold-out et projection",
+            "Residus hold-out",
+        ),
+        vertical_spacing=0.13,
+        row_heights=[0.72, 0.28],
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=hist_tail.index,
+            y=hist_tail.values,
+            mode="lines",
+            name="Historique",
+            line=dict(color="#1F4E78", width=2),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=result.holdout["date"],
+            y=result.holdout["actual"],
+            mode="lines+markers",
+            name="Realise hold-out",
+            line=dict(color="#000000", width=1.5),
+            marker=dict(size=5),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=result.holdout["date"],
+            y=result.holdout["prediction"],
+            mode="lines",
+            name="Prediction hold-out",
+            line=dict(color="#F28E2B", width=2, dash="dash"),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=result.projection["date"],
+            y=result.projection["ic_high"],
+            mode="lines",
+            name="IC haut",
+            line=dict(color="rgba(78,121,167,0.0)"),
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=result.projection["date"],
+            y=result.projection["ic_low"],
+            mode="lines",
+            name="IC empirique",
+            fill="tonexty",
+            fillcolor="rgba(78,121,167,0.18)",
+            line=dict(color="rgba(78,121,167,0.0)"),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=result.projection["date"],
+            y=result.projection["forecast"],
+            mode="lines+markers",
+            name="Forecast central",
+            line=dict(color="#C00000", width=2),
+            marker=dict(size=5),
+        ),
+        row=1,
+        col=1,
+    )
+    if "peak_scenario_forecast" in result.projection.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=result.projection["date"],
+                y=result.projection["peak_scenario_forecast"],
+                mode="lines",
+                name="Scenario pic",
+                line=dict(color="#70AD47", width=2, dash="dot"),
+            ),
+            row=1,
+            col=1,
+        )
+
+    if "peak_risk" in result.projection.columns:
+        risky = result.projection[result.projection["peak_risk"].isin(["watch", "high"])]
+        if not risky.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=risky["date"],
+                    y=risky["forecast"],
+                    mode="markers",
+                    name="Risque pic",
+                    marker=dict(color="#7030A0", size=9, symbol="diamond"),
+                ),
+                row=1,
+                col=1,
+            )
+
+    fig.add_trace(
+        go.Scatter(
+            x=result.holdout["date"],
+            y=residuals,
+            mode="markers",
+            name="Residus",
+            marker=dict(color="#7F7F7F", size=6),
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
+
+    fig.update_layout(
+        title=(
+            f"{result.target}<br>"
+            f"<sub>Modele: {result.final_model} | MAPE: {mape_value:.2f}% | "
+            f"Peak capture: {peak_text}</sub>"
+        ),
+        template="plotly_white",
+        height=850,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        margin=dict(l=55, r=30, t=105, b=60),
+    )
+    fig.update_yaxes(title_text="Valeur", row=1, col=1)
+    fig.update_yaxes(title_text="Erreur", row=2, col=1)
+    fig.update_xaxes(title_text="Date", row=2, col=1)
+
+    path = output_dir / f"serie_{prefix}_{safe_sheet_name(result.target)}.html"
+    fig.write_html(path)
+    return path
+
+
 def run_bundle(name: str, targets: list[str], config: ForecastConfig, add_total: bool = False) -> list[ForecastResult]:
     df = load_workbook(config)
     if add_total:
@@ -815,8 +1094,19 @@ def run_bundle(name: str, targets: list[str], config: ForecastConfig, add_total:
 
     results = [run_one_target(df, target, config) for target in targets]
     out_xlsx = save_result_bundle(name, results, config)
+    dashboard_path = create_visualization_dashboard(results, config.output_dir, name)
+    if dashboard_path is not None:
+        print(f"Saved dashboard: {dashboard_path}")
     for result in results:
         plot_result(result, df[result.target].astype(float).dropna(), config.output_dir, name)
+        html_path = create_individual_interactive_chart(
+            result,
+            df[result.target].astype(float).dropna(),
+            config.output_dir,
+            name,
+        )
+        if html_path is not None:
+            print(f"Saved interactive chart: {html_path}")
     print(f"Saved workbook: {out_xlsx}")
     for result in results:
         mape_value = result.diagnostics.loc[result.diagnostics["metric"] == "holdout_MAPE", "value"].iloc[0]
