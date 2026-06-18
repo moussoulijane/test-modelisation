@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 import warnings
@@ -49,6 +50,9 @@ class ForecastConfig:
     peak_metric_weight: float = 0.45
     peak_weight_multiplier: float = 4.0
     max_mape_degradation_vs_baseline_pct: float = 25.0
+    multi_holdout_windows: int = 3
+    multi_holdout_horizon: int = 30
+    multi_holdout_wf_folds: int = 3
 
 
 @dataclass
@@ -59,6 +63,7 @@ class ForecastResult:
     holdout: pd.DataFrame
     diagnostics: pd.DataFrame
     candidates: pd.DataFrame
+    multi_holdout: pd.DataFrame
     profile: pd.DataFrame
 
 
@@ -470,21 +475,26 @@ def evaluate_walk_forward(y: pd.Series, config: ForecastConfig) -> pd.DataFrame:
         wf.groupby("model", as_index=False)
         .agg(
             wf_MAPE_median=("MAPE", "median"),
+            wf_MAPE_std=("MAPE", "std"),
             wf_peak_wMAPE_median=("peak_wMAPE", "median"),
             wf_peak_capture_mean=("peak_capture", "mean"),
             wf_score_median=("score", "median"),
+            wf_score_std=("score", "std"),
             wf_MAPE_mean=("MAPE", "mean"),
             wf_MASE_median=("MASE", "median"),
         )
-        .sort_values("wf_score_median")
         .reset_index(drop=True)
     )
+    med["wf_MAPE_std"] = med["wf_MAPE_std"].fillna(0.0)
+    med["wf_score_std"] = med["wf_score_std"].fillna(0.0)
+    med["wf_selection_score"] = med["wf_score_median"] + 0.50 * med["wf_score_std"]
+    med = med.sort_values("wf_selection_score").reset_index(drop=True)
     return med
 
 
 def inverse_mape_weights(candidate_scores: pd.DataFrame, top_n: int) -> dict[str, float]:
     non_base = candidate_scores[~candidate_scores["model"].str.startswith("BASELINE_")].copy()
-    score_col = "wf_score_median" if "wf_score_median" in non_base.columns else "wf_MAPE_median"
+    score_col = "wf_selection_score" if "wf_selection_score" in non_base.columns else "wf_score_median"
     non_base = non_base.replace([np.inf, -np.inf], np.nan).dropna(subset=[score_col])
     non_base = non_base.sort_values(score_col).head(top_n)
     if non_base.empty:
@@ -503,6 +513,129 @@ def weighted_ensemble(forecasts: dict[str, np.ndarray], weights: dict[str, float
     for name, weight in active.items():
         out += (weight / total) * forecasts[name]
     return out
+
+
+def evaluate_forecast_panel(
+    y_train: pd.Series,
+    y_true: pd.Series,
+    forecasts: dict[str, np.ndarray],
+    config: ForecastConfig,
+    prefix: str,
+) -> pd.DataFrame:
+    rows = []
+    for name, pred in forecasts.items():
+        if len(pred) != len(y_true) or not np.all(np.isfinite(pred)):
+            continue
+        mape_value = mape(y_true.values, pred)
+        peak_mape_value = peak_weighted_mape(
+            y_true.values,
+            pred,
+            y_train.values,
+            config.peak_quantile,
+            config.peak_weight_multiplier,
+        )
+        peak_capture_value = peak_capture_rate(
+            y_true.values,
+            pred,
+            y_train.values,
+            config.peak_quantile,
+        )
+        rows.append(
+            {
+                "model": name,
+                f"{prefix}_MAPE": mape_value,
+                f"{prefix}_sMAPE": smape(y_true.values, pred),
+                f"{prefix}_MAE": mae(y_true.values, pred),
+                f"{prefix}_RMSE": rmse(y_true.values, pred),
+                f"{prefix}_MASE": mase(y_true.values, pred, y_train.values, config.seasonal_period),
+                f"{prefix}_peak_wMAPE": peak_mape_value,
+                f"{prefix}_peak_capture": peak_capture_value,
+                f"{prefix}_score": balanced_model_score(
+                    mape_value,
+                    peak_mape_value,
+                    peak_capture_value,
+                    config,
+                ),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(f"{prefix}_score").reset_index(drop=True)
+
+
+def select_models_from_wf(wf_scores: pd.DataFrame, config: ForecastConfig) -> dict[str, object]:
+    """Select final and peak-scenario models from pre-holdout WF only."""
+    if wf_scores.empty:
+        raise ValueError("No walk-forward scores available")
+
+    baselines = wf_scores[wf_scores["model"].str.startswith("BASELINE_")].copy()
+    non_baselines = wf_scores[~wf_scores["model"].str.startswith("BASELINE_")].copy()
+    if baselines.empty:
+        raise ValueError("No baseline scores available")
+    if non_baselines.empty:
+        best = baselines.sort_values("wf_MAPE_median").iloc[0]
+        return {
+            "final_model": str(best["model"]),
+            "proposed_model": "",
+            "peak_scenario_model": str(best["model"]),
+            "best_baseline": str(best["model"]),
+            "best_mape_baseline": str(best["model"]),
+            "selection_gain_pct": 0.0,
+            "selection_mape_degradation_pct": 0.0,
+        }
+
+    score_col = "wf_selection_score" if "wf_selection_score" in wf_scores.columns else "wf_score_median"
+    best_score_baseline = baselines.sort_values(score_col).iloc[0]
+    best_mape_baseline = baselines.sort_values("wf_MAPE_median").iloc[0]
+    baseline_score = float(best_score_baseline[score_col])
+    baseline_mape = float(best_mape_baseline["wf_MAPE_median"])
+
+    ordered_candidates = non_baselines.sort_values(score_col).reset_index(drop=True)
+    proposed = ordered_candidates.iloc[0]
+    proposed_gain = (
+        (baseline_score - float(proposed[score_col]))
+        / max(baseline_score, 1e-9)
+        * 100
+    )
+    proposed_mape_degradation = (
+        (float(proposed["wf_MAPE_median"]) - baseline_mape)
+        / max(baseline_mape, 1e-9)
+        * 100
+    )
+
+    final_model = str(best_mape_baseline["model"])
+    for _, row in ordered_candidates.iterrows():
+        row_gain = (
+            (baseline_score - float(row[score_col]))
+            / max(baseline_score, 1e-9)
+            * 100
+        )
+        row_mape_degradation = (
+            (float(row["wf_MAPE_median"]) - baseline_mape)
+            / max(baseline_mape, 1e-9)
+            * 100
+        )
+        if (
+            row_gain >= config.min_gain_vs_baseline_pct
+            and row_mape_degradation <= config.max_mape_degradation_vs_baseline_pct
+        ):
+            final_model = str(row["model"])
+            break
+
+    peak_candidates = non_baselines.copy()
+    peak_candidates["capture_rank"] = peak_candidates["wf_peak_capture_mean"].fillna(-1.0)
+    peak_scenario = peak_candidates.sort_values(
+        ["capture_rank", "wf_peak_wMAPE_median", "wf_score_median"],
+        ascending=[False, True, True],
+    ).iloc[0]
+
+    return {
+        "final_model": final_model,
+        "proposed_model": str(proposed["model"]),
+        "peak_scenario_model": str(peak_scenario["model"]),
+        "best_baseline": str(best_score_baseline["model"]),
+        "best_mape_baseline": str(best_mape_baseline["model"]),
+        "selection_gain_pct": float(proposed_gain),
+        "selection_mape_degradation_pct": float(proposed_mape_degradation),
+    }
 
 
 def series_profile(y: pd.Series) -> pd.DataFrame:
@@ -531,6 +664,71 @@ def series_profile(y: pd.Series) -> pd.DataFrame:
     )
 
 
+def run_multi_holdout_audit(y: pd.Series, config: ForecastConfig) -> pd.DataFrame:
+    rows = []
+    horizon = config.multi_holdout_horizon
+    audit_config = replace(config, wf_folds=config.multi_holdout_wf_folds, wf_horizon=horizon)
+    total_needed = horizon * config.multi_holdout_windows + config.holdout_len
+    if len(y) < total_needed + 220:
+        return pd.DataFrame()
+
+    for window_num in range(config.multi_holdout_windows, 0, -1):
+        test_end = len(y) - (window_num - 1) * horizon
+        test_start = test_end - horizon
+        if test_start <= 220:
+            continue
+
+        train = y.iloc[:test_start]
+        test = y.iloc[test_start:test_end]
+        try:
+            wf_scores = evaluate_walk_forward(train, audit_config)
+            selection = select_models_from_wf(wf_scores, audit_config)
+            weights = inverse_mape_weights(wf_scores, audit_config.top_n_ensemble)
+            forecasts = model_forecasts(train, len(test), test.index)
+            ensemble = weighted_ensemble(forecasts, weights, len(test))
+            if ensemble is not None:
+                forecasts["ENSEMBLE_wf_top"] = ensemble
+            model = str(selection["final_model"])
+            if model not in forecasts:
+                model = str(selection["best_mape_baseline"])
+            pred = forecasts[model]
+            metrics = evaluate_forecast_panel(train, test, {model: pred}, audit_config, "audit").iloc[0]
+            rows.append(
+                {
+                    "window": config.multi_holdout_windows - window_num + 1,
+                    "train_end": train.index[-1],
+                    "test_start": test.index[0],
+                    "test_end": test.index[-1],
+                    "selected_model": model,
+                    "peak_scenario_model": selection["peak_scenario_model"],
+                    "audit_MAPE": metrics["audit_MAPE"],
+                    "audit_peak_wMAPE": metrics["audit_peak_wMAPE"],
+                    "audit_peak_capture": metrics["audit_peak_capture"],
+                    "audit_score": metrics["audit_score"],
+                    "n_test": len(test),
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "window": config.multi_holdout_windows - window_num + 1,
+                    "train_end": y.index[test_start - 1],
+                    "test_start": y.index[test_start],
+                    "test_end": y.index[test_end - 1],
+                    "selected_model": "ERROR",
+                    "peak_scenario_model": "",
+                    "audit_MAPE": np.nan,
+                    "audit_peak_wMAPE": np.nan,
+                    "audit_peak_capture": np.nan,
+                    "audit_score": np.nan,
+                    "n_test": len(test),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
 def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> ForecastResult:
     if target not in df.columns:
         raise KeyError(target)
@@ -540,6 +738,7 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
 
     selection_y = y.iloc[: -config.holdout_len]
     wf_scores = evaluate_walk_forward(selection_y, config)
+    selection = select_models_from_wf(wf_scores, config)
     weights = inverse_mape_weights(wf_scores, config.top_n_ensemble)
 
     train = y.iloc[: -config.holdout_len]
@@ -549,85 +748,11 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
     if ensemble_holdout is not None:
         holdout_forecasts["ENSEMBLE_wf_top"] = ensemble_holdout
 
-    holdout_rows = []
-    for name, pred in holdout_forecasts.items():
-        mape_value = mape(holdout.values, pred)
-        peak_mape_value = peak_weighted_mape(
-            holdout.values,
-            pred,
-            train.values,
-            config.peak_quantile,
-            config.peak_weight_multiplier,
-        )
-        peak_capture_value = peak_capture_rate(
-            holdout.values,
-            pred,
-            train.values,
-            config.peak_quantile,
-        )
-        holdout_rows.append(
-            {
-                "model": name,
-                "holdout_MAPE": mape_value,
-                "holdout_sMAPE": smape(holdout.values, pred),
-                "holdout_MAE": mae(holdout.values, pred),
-                "holdout_RMSE": rmse(holdout.values, pred),
-                "holdout_MASE": mase(holdout.values, pred, train.values, config.seasonal_period),
-                "holdout_peak_wMAPE": peak_mape_value,
-                "holdout_peak_capture": peak_capture_value,
-                "holdout_score": balanced_model_score(
-                    mape_value,
-                    peak_mape_value,
-                    peak_capture_value,
-                    config,
-                ),
-            }
-        )
-    holdout_scores = pd.DataFrame(holdout_rows).sort_values("holdout_score").reset_index(drop=True)
-
-    best_baseline = (
-        holdout_scores[holdout_scores["model"].str.startswith("BASELINE_")]
-        .sort_values("holdout_score")
-        .iloc[0]
-    )
-    best_mape_baseline = (
-        holdout_scores[holdout_scores["model"].str.startswith("BASELINE_")]
-        .sort_values("holdout_MAPE")
-        .iloc[0]
-    )
-    non_baseline_scores = (
-        holdout_scores[~holdout_scores["model"].str.startswith("BASELINE_")]
-        .sort_values("holdout_score")
-        .reset_index(drop=True)
-    )
-    proposed_model = non_baseline_scores.iloc[0]["model"]
-    proposed_score = float(holdout_scores.loc[holdout_scores["model"] == proposed_model, "holdout_score"].iloc[0])
-    proposed_mape = float(holdout_scores.loc[holdout_scores["model"] == proposed_model, "holdout_MAPE"].iloc[0])
-    baseline_score = float(best_baseline["holdout_score"])
-    baseline_mape = float(best_mape_baseline["holdout_MAPE"])
-    gain = (baseline_score - proposed_score) / max(baseline_score, 1e-9) * 100
-    mape_degradation = (proposed_mape - baseline_mape) / max(baseline_mape, 1e-9) * 100
-    final_model = str(best_mape_baseline["model"])
-    for _, row in non_baseline_scores.iterrows():
-        row_score = float(row["holdout_score"])
-        row_mape = float(row["holdout_MAPE"])
-        row_gain = (baseline_score - row_score) / max(baseline_score, 1e-9) * 100
-        row_mape_degradation = (row_mape - baseline_mape) / max(baseline_mape, 1e-9) * 100
-        if (
-            row_gain >= config.min_gain_vs_baseline_pct
-            and row_mape_degradation <= config.max_mape_degradation_vs_baseline_pct
-        ):
-            final_model = str(row["model"])
-            break
-
-    peak_candidates = non_baseline_scores.copy()
-    peak_candidates["capture_rank"] = peak_candidates["holdout_peak_capture"].fillna(-1.0)
-    peak_scenario_model = str(
-        peak_candidates.sort_values(
-            ["capture_rank", "holdout_peak_wMAPE", "holdout_score"],
-            ascending=[False, True, True],
-        ).iloc[0]["model"]
-    )
+    holdout_scores = evaluate_forecast_panel(train, holdout, holdout_forecasts, config, "holdout")
+    final_model = str(selection["final_model"])
+    peak_scenario_model = str(selection["peak_scenario_model"])
+    if final_model not in holdout_forecasts:
+        final_model = str(selection["best_mape_baseline"])
 
     future_idx = ma_business_days(y.index[-1] + pd.Timedelta(days=1), config.forecast_horizon)
     future_forecasts = model_forecasts(y, config.forecast_horizon, future_idx)
@@ -635,14 +760,14 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
     if ensemble_future is not None:
         future_forecasts["ENSEMBLE_wf_top"] = ensemble_future
     if final_model not in future_forecasts:
-        final_model = str(best_mape_baseline["model"])
+        final_model = str(selection["best_mape_baseline"])
     yhat_future = future_forecasts[final_model]
     peak_scenario_future = future_forecasts.get(peak_scenario_model, yhat_future)
 
     holdout_pred = (
         holdout_forecasts[final_model]
         if final_model in holdout_forecasts
-        else holdout_forecasts[str(best_mape_baseline["model"])]
+        else holdout_forecasts[str(selection["best_mape_baseline"])]
     )
     residuals = holdout.values - holdout_pred
     q_lo = float(np.quantile(residuals, config.alpha / 2))
@@ -709,16 +834,44 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
     candidates = candidates.sort_values(["holdout_score", "wf_score_median"], na_position="last")
 
     final_metrics = holdout_scores.loc[holdout_scores["model"] == final_model].iloc[0]
+    multi_holdout = run_multi_holdout_audit(y, config)
+    multi_mape_mean = multi_holdout["audit_MAPE"].mean() if not multi_holdout.empty else np.nan
+    multi_score_mean = multi_holdout["audit_score"].mean() if not multi_holdout.empty else np.nan
+    holdout_mape_value = float(final_metrics["holdout_MAPE"])
+    holdout_score_value = float(final_metrics["holdout_score"])
+    if (
+        holdout_mape_value <= 2.0
+        and (not np.isfinite(multi_mape_mean) or multi_mape_mean <= 2.5)
+        and holdout_score_value <= 3.0
+    ):
+        robustness_flag = "high"
+        decision_recommendation = "usable_as_central_decision_forecast"
+    elif (
+        holdout_mape_value <= 3.5
+        and (not np.isfinite(multi_mape_mean) or multi_mape_mean <= 4.0)
+        and holdout_score_value <= 5.0
+    ):
+        robustness_flag = "medium"
+        decision_recommendation = "use_with_peak_scenario_and_monitoring"
+    else:
+        robustness_flag = "low"
+        decision_recommendation = "do_not_use_alone_needs_business_exogenous_inputs"
+
+    projection["robustness_flag"] = robustness_flag
+    projection["decision_recommendation"] = decision_recommendation
+
     diagnostics = pd.DataFrame(
         [
             {"metric": "target", "value": target},
             {"metric": "final_model", "value": final_model},
-            {"metric": "proposed_model", "value": proposed_model},
+            {"metric": "selection_basis", "value": "pre_holdout_walk_forward_only"},
+            {"metric": "holdout_used_for_model_selection", "value": False},
+            {"metric": "proposed_model", "value": selection["proposed_model"]},
             {"metric": "peak_scenario_model", "value": peak_scenario_model},
-            {"metric": "best_baseline", "value": best_baseline["model"]},
-            {"metric": "best_mape_baseline", "value": best_mape_baseline["model"]},
-            {"metric": "gain_vs_best_baseline_pct", "value": gain},
-            {"metric": "mape_degradation_vs_best_baseline_pct", "value": mape_degradation},
+            {"metric": "best_baseline", "value": selection["best_baseline"]},
+            {"metric": "best_mape_baseline", "value": selection["best_mape_baseline"]},
+            {"metric": "selection_gain_vs_best_baseline_pct", "value": selection["selection_gain_pct"]},
+            {"metric": "selection_mape_degradation_vs_best_baseline_pct", "value": selection["selection_mape_degradation_pct"]},
             {"metric": "min_required_gain_pct", "value": config.min_gain_vs_baseline_pct},
             {"metric": "max_allowed_mape_degradation_pct", "value": config.max_mape_degradation_vs_baseline_pct},
             {"metric": "holdout_MAPE", "value": final_metrics["holdout_MAPE"]},
@@ -731,6 +884,11 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
             {"metric": "holdout_MASE", "value": final_metrics["holdout_MASE"]},
             {"metric": "holdout_resid_skew", "value": stats.skew(residuals)},
             {"metric": "holdout_resid_kurtosis", "value": stats.kurtosis(residuals)},
+            {"metric": "multi_holdout_windows", "value": len(multi_holdout)},
+            {"metric": "multi_holdout_MAPE_mean", "value": multi_mape_mean},
+            {"metric": "multi_holdout_score_mean", "value": multi_score_mean},
+            {"metric": "robustness_flag", "value": robustness_flag},
+            {"metric": "decision_recommendation", "value": decision_recommendation},
             {"metric": "n_obs", "value": len(y)},
             {"metric": "holdout_len", "value": config.holdout_len},
             {"metric": "forecast_horizon", "value": config.forecast_horizon},
@@ -744,6 +902,7 @@ def run_one_target(df: pd.DataFrame, target: str, config: ForecastConfig) -> For
         holdout=holdout_df,
         diagnostics=diagnostics,
         candidates=candidates,
+        multi_holdout=multi_holdout,
         profile=series_profile(y),
     )
 
@@ -760,6 +919,7 @@ def save_result_bundle(name: str, results: list[ForecastResult], config: Forecas
             r.projection.to_excel(writer, sheet_name=f"proj_{short}", index=False)
             r.holdout.to_excel(writer, sheet_name=f"hold_{short}", index=False)
             r.candidates.to_excel(writer, sheet_name=f"models_{short}", index=False)
+            r.multi_holdout.to_excel(writer, sheet_name=f"audit_{short}", index=False)
             r.profile.to_excel(writer, sheet_name=f"profile_{short}", index=False)
     return out_path
 
@@ -820,6 +980,9 @@ def run_bundle(name: str, targets: list[str], config: ForecastConfig, add_total:
     print(f"Saved workbook: {out_xlsx}")
     for result in results:
         mape_value = result.diagnostics.loc[result.diagnostics["metric"] == "holdout_MAPE", "value"].iloc[0]
-        gain_value = result.diagnostics.loc[result.diagnostics["metric"] == "gain_vs_best_baseline_pct", "value"].iloc[0]
-        print(f"{result.target}: model={result.final_model}, MAPE={float(mape_value):.3f}%, gain={float(gain_value):+.2f}%")
+        score_value = result.diagnostics.loc[result.diagnostics["metric"] == "holdout_score", "value"].iloc[0]
+        print(
+            f"{result.target}: model={result.final_model}, "
+            f"holdout_MAPE={float(mape_value):.3f}%, holdout_score={float(score_value):.3f}"
+        )
     return results

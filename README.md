@@ -23,6 +23,13 @@ Les notebooks robustes intègrent aussi une logique **peak-aware** :
 - garde-fou : un modèle peak-aware n'est retenu que s'il améliore le score décisionnel sans dégrader la MAPE globale de plus de 25 % vs baseline ;
 - projection avec deux lectures : `forecast` retenu et `peak_scenario_forecast` pour le scénario de pic.
 
+La validation a été durcie pour éviter la fuite de sélection :
+
+- le modèle final est sélectionné uniquement sur le walk-forward **avant** le hold-out final ;
+- le hold-out final sert uniquement d'audit non vu, il ne choisit plus le modèle ;
+- un audit multi-holdout rejoue plusieurs fenêtres historiques avec sélection recalculée à chaque fenêtre ;
+- les exports ajoutent `robustness_flag` et `decision_recommendation`.
+
 ## Structure
 
 ```
