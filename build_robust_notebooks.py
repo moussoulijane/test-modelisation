@@ -121,10 +121,8 @@ for result in results:
         "peak_wmape_holdout": diag["holdout_peak_wMAPE"],
         "peak_capture": diag["holdout_peak_capture"],
         "score_decision": diag["holdout_score"],
-        "selection_gain_vs_baseline_pct": diag["selection_gain_vs_best_baseline_pct"],
-        "selection_mape_degradation_pct": diag["selection_mape_degradation_vs_best_baseline_pct"],
-        "robustesse": diag["robustness_flag"],
-        "recommendation": diag["decision_recommendation"],
+        "gain_vs_baseline_pct": diag["gain_vs_best_baseline_pct"],
+        "mape_degradation_vs_baseline_pct": diag["mape_degradation_vs_best_baseline_pct"],
     })
 summary = pd.DataFrame(summary_rows)
 display(summary)
@@ -145,18 +143,10 @@ for result in results:
     print("\\n", result.target)
     cols = [
         "model", "holdout_score", "holdout_MAPE", "holdout_peak_wMAPE",
-        "holdout_peak_capture", "wf_selection_score", "wf_score_median", "wf_peak_wMAPE_median",
+        "holdout_peak_capture", "wf_score_median", "wf_peak_wMAPE_median",
         "wf_peak_capture_mean", "ensemble_weight"
     ]
     display(result.candidates[cols].sort_values("holdout_score"))
-"""
-        ),
-        md("## Audit multi-holdout sans fuite"),
-        code(
-            """\
-for result in results:
-    print("\\n", result.target)
-    display(result.multi_holdout)
 """
         ),
     ]
@@ -225,10 +215,8 @@ for result in results:
         "peak_wmape_holdout": diag["holdout_peak_wMAPE"],
         "peak_capture": diag["holdout_peak_capture"],
         "score_decision": diag["holdout_score"],
-        "selection_gain_vs_baseline_pct": diag["selection_gain_vs_best_baseline_pct"],
-        "selection_mape_degradation_pct": diag["selection_mape_degradation_vs_best_baseline_pct"],
-        "robustesse": diag["robustness_flag"],
-        "recommendation": diag["decision_recommendation"],
+        "gain_vs_baseline_pct": diag["gain_vs_best_baseline_pct"],
+        "mape_degradation_vs_baseline_pct": diag["mape_degradation_vs_best_baseline_pct"],
     })
 summary = pd.DataFrame(summary_rows)
 display(summary)
@@ -247,17 +235,10 @@ for result in results:
 for result in results:
     cols = [
         "model", "holdout_score", "holdout_MAPE", "holdout_peak_wMAPE",
-        "holdout_peak_capture", "wf_selection_score", "wf_score_median", "wf_peak_wMAPE_median",
+        "holdout_peak_capture", "wf_score_median", "wf_peak_wMAPE_median",
         "wf_peak_capture_mean", "ensemble_weight"
     ]
     display(result.candidates[cols].sort_values("holdout_score"))
-"""
-        ),
-        md("## Audit multi-holdout sans fuite"),
-        code(
-            """\
-for result in results:
-    display(result.multi_holdout)
 """
         ),
     ]
