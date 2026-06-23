@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Banking input data and generated reports stay local by default.
+in/*
+!in/.gitkeep
+out/*
+!out/.gitkeep
